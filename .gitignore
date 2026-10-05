@@ -1,0 +1,24 @@
+﻿.env
+.env.*
+!.env.example
+
+node_modules/
+**/node_modules/
+
+.next/
+**/.next/
+
+logs/
+*.log
+
+scratch/
+
+.vscode/
+.idea/
+
+.DS_Store
+Thumbs.db
+
+
+# Local/imported contact data
+data/raw/

@@ -1,0 +1,154 @@
+services:
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: email-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+    networks:
+      - email-platform
+
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: email-n8n
+    restart: unless-stopped
+
+    ports:
+      - "5678:5678"
+
+    environment:
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ${POSTGRES_DB}
+      DB_POSTGRESDB_USER: ${POSTGRES_USER}
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_POSTGRESDB_SCHEMA: n8n
+
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+
+      NODE_ENV: production
+
+      GENERIC_TIMEZONE: Asia/Kolkata
+      TZ: Asia/Kolkata
+
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      FIRST_CLIENT_CAMPAIGN_ID: ${FIRST_CLIENT_CAMPAIGN_ID}
+      LISTMONK_TX_TEMPLATE_ID: ${LISTMONK_TX_TEMPLATE_ID}
+      FIRST_CLIENT_SEND_MODE: ${FIRST_CLIENT_SEND_MODE}
+      LISTMONK_API_AUTH: ${LISTMONK_API_AUTH}
+
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+
+    volumes:
+      - n8n_data:/home/node/.n8n
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - email-platform
+
+
+  listmonk:
+    image: listmonk/listmonk:v6.2.0
+    container_name: email-listmonk
+    restart: unless-stopped
+
+    ports:
+      - "9000:9000"
+
+    command:
+      - sh
+      - -c
+      - "./listmonk --install --idempotent --yes --config '' && ./listmonk --upgrade --yes --config '' && ./listmonk --config ''"
+
+    environment:
+      LISTMONK_app__address: 0.0.0.0:9000
+
+      LISTMONK_db__user: ${POSTGRES_USER}
+      LISTMONK_db__password: ${POSTGRES_PASSWORD}
+      LISTMONK_db__database: listmonk
+      LISTMONK_db__host: postgres
+      LISTMONK_db__port: 5432
+      LISTMONK_db__ssl_mode: disable
+
+      LISTMONK_db__max_open: 25
+      LISTMONK_db__max_idle: 25
+      LISTMONK_db__max_lifetime: 300s
+
+      TZ: Asia/Kolkata
+
+    volumes:
+      - listmonk_uploads:/listmonk/uploads
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - email-platform
+
+
+  control-center:
+    build:
+      context: ./control-center
+      dockerfile: Dockerfile
+
+    container_name: first-client-control-center
+    restart: unless-stopped
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      NODE_ENV: development
+      LISTMONK_API_URL: ${LISTMONK_API_URL}
+      LISTMONK_API_USER: ${LISTMONK_API_USER}
+      LISTMONK_API_TOKEN: ${LISTMONK_API_TOKEN}
+
+    volumes:
+      - ./control-center:/app
+      - control_center_node_modules:/app/node_modules
+      - control_center_next:/app/.next
+
+    command: npm run dev
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    networks:
+      - email-platform
+
+
+volumes:
+  postgres_data:
+  n8n_data:
+  listmonk_uploads:
+  control_center_node_modules:
+  control_center_next:
+
+
+networks:
+  email-platform:
+    driver: bridge

@@ -1,0 +1,1375 @@
+{
+  "name": "First Client - Production Send Executor - Control Center",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {
+        "content": "Listmonk API\n\nConfigured through n8n environment variables."
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -448,
+        272
+      ],
+      "typeVersion": 1,
+      "id": "55968e07-9e68-41e7-9dd7-22cf7a58fc7b",
+      "name": "Sticky Note"
+    },
+    {
+      "parameters": {
+        "content": "PRODUCTION SETUP\n\nRequired n8n environment variables:\n1. LISTMONK_API_BASIC = current Listmonk Authorization value.\n2. LISTMONK_TX_TEMPLATE_ID = Listmonk transactional template ID.\n3. FIRST_CLIENT_CAMPAIGN_ID = campaign ID to execute.\n4. FIRST_CLIENT_SEND_MODE = real or disabled. Keep disabled until the controlled test passes.\n5. FIRST_CLIENT_STALE_MINUTES = stale-send recovery threshold, normally 30.\n\nProduction rules:\n- PostgreSQL is the source of truth.\n- The worker claims exactly one recipient per execution.\n- The real-send safety gate runs before a recipient is claimed.\n- Never hard-code API credentials or campaign/template IDs in this workflow.\n- Verify PostgreSQL rate-limit and retry-backoff enforcement before activation.\n- Provider/event reconciliation and unsubscribe/bounce/complaint synchronization remain separate production workflows.\n\n\n### FINAL PRODUCTION HARDENING\n- Environment values are read from container env vars.\n- Real-send gate reads Production Send Configuration directly.\n- Provider success accepts Listmonk response in either top-level or body.data.\n- Success finalization uses mark_send_success_production, which does not double-count rate usage because claim_one_send_slot reserves the slot.\n- Keep workflow inactive until the controlled real-send test passes.\n",
+        "height": 260,
+        "width": 420
+      },
+      "id": "71fd52dd-9e4e-4ac1-a6bb-91854acf2fb8",
+      "name": "Production Setup Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        0,
+        96
+      ]
+    },
+    {
+      "parameters": {
+        "content": "DATABASE PREREQUISITES BEFORE PRODUCTION\n\n1. claim_one_send_slot must enforce campaign/global rate limits.\n2. claim_one_send_slot must exclude queued recipients whose latest retry has next_retry_at > NOW().\n3. Stale recovery must only recover sends after the configured threshold.\n4. Provider acceptance followed by worker crash is an inherent delivery ambiguity. Keep recipient='sending' until stale recovery, and reconcile provider events separately.\n5. Keep the separate provider-event/unsubscribe/bounce reconciliation workflow in production.",
+        "height": 250,
+        "width": 420
+      },
+      "id": "b35bbc8e-a6d9-4f23-8cd4-ea026373414f",
+      "name": "Database Production Prerequisites",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        704,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "content": "LISTMONK API SECURITY\n\nDo not store API tokens in workflow nodes or sticky notes.\nUse n8n environment variable LISTMONK_API_BASIC.\nRotate any credential that has previously been exposed.\n"
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        640,
+        112
+      ],
+      "typeVersion": 1,
+      "id": "6c6faea2-7438-453c-86b2-5b44df36f5b1",
+      "name": "Sticky Note1"
+    },
+    {
+      "parameters": {
+        "content": "PRODUCTION SEND EXECUTOR\n\nPurpose\n• One controlled email-send attempt per workflow execution.\n• PostgreSQL is the source of truth.\n• Listmonk is the transactional delivery engine.\n• The workflow never chooses recipients directly.\n\nControl flow\n1. Configuration validation\n2. Recover stale sends\n3. Activate due campaign\n4. Confirm campaign is running\n5. REAL-SEND SAFETY GATE\n6. Claim exactly one send slot\n7. Create send attempt\n8. Load + validate send context\n9. Send through Listmonk\n10. Record success/failure\n11. Finalize campaign if complete\n\nCRITICAL\nThe real-send gate is BEFORE recipient claim.\nThere is only ONE path into the gate.\nThis prevents duplicate claims in a single execution.",
+        "height": 310,
+        "width": 600
+      },
+      "id": "255f53be-2f74-4ef9-864b-737137516ef0",
+      "name": "01 • EXECUTOR ARCHITECTURE",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1184,
+        208
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "edc59f00-dcfe-43e7-a232-cf5cb7017a68",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -2160,
+        1392
+      ]
+    },
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        }
+      },
+      "id": "25394f84-b1b7-43c7-ae55-954d2f385944",
+      "name": "Every Minute",
+      "type": "n8n-nodes-base.cron",
+      "typeVersion": 1,
+      "position": [
+        -2160,
+        1712
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "campaign-id",
+              "name": "campaign_id",
+              "value": "={{ Number($json.body?.campaign_id || 0) }}",
+              "type": "number"
+            },
+            {
+              "id": "provider",
+              "name": "provider",
+              "value": "listmonk",
+              "type": "string"
+            },
+            {
+              "id": "template-id",
+              "name": "template_id",
+              "value": "={{ $env.LISTMONK_TX_TEMPLATE_ID ? Number($env.LISTMONK_TX_TEMPLATE_ID) : 0 }}",
+              "type": "number"
+            },
+            {
+              "id": "send-mode",
+              "name": "send_mode",
+              "value": "={{ $env.FIRST_CLIENT_SEND_MODE || 'disabled' }}",
+              "type": "string"
+            },
+            {
+              "id": "stale-minutes",
+              "name": "stale_minutes",
+              "value": "={{ $env.FIRST_CLIENT_STALE_MINUTES ? Number($env.FIRST_CLIENT_STALE_MINUTES) : 30 }}",
+              "type": "number"
+            },
+            {
+              "id": "max-retries-per-run",
+              "name": "max_attempts_per_run",
+              "value": 1,
+              "type": "number"
+            },
+            {
+              "id": "listmonk-api-auth-present",
+              "name": "listmonk_api_auth_present",
+              "value": "={{ Boolean($env.LISTMONK_API_AUTH) }}",
+              "type": "boolean"
+            },
+            {
+              "id": "request-source",
+              "name": "request_source",
+              "value": "={{ $json.body ? 'control_center_webhook' : 'scheduler_or_manual' }}",
+              "type": "string"
+            },
+            {
+              "id": "request-action",
+              "name": "request_action",
+              "value": "={{ $json.body?.action || 'scheduled' }}",
+              "type": "string"
+            },
+            {
+              "id": "request-secret-valid",
+              "name": "request_secret_valid",
+              "value": "={{ $json.body ? (String($json.body.secret || '') === ($env.N8N_EXECUTION_WEBHOOK_SECRET)) : true }}",
+              "type": "boolean"
+            },
+            {
+              "id": "execution-request-id",
+              "name": "execution_request_id",
+              "value": "={{ $json.body?.execution_id || $execution.id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "0d3bdf16-ec42-4218-8023-e4e71ebb1560",
+      "name": "Production Send Configuration",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -1552,
+        1616
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Number($('Production Send Configuration').first().json.campaign_id) > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "campaign-config-valid"
+            },
+            {
+              "leftValue": "={{ true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "template-config-valid"
+            },
+            {
+              "leftValue": "={{ ['real','disabled'].includes(String($('Production Send Configuration').first().json.send_mode).toLowerCase()) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "send-mode-valid"
+            },
+            {
+              "leftValue": "={{ String($('Production Send Configuration').first().json.provider).toLowerCase() === 'listmonk' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "provider-valid"
+            },
+            {
+              "leftValue": "={{ Number($('Production Send Configuration').first().json.stale_minutes) >= 5 && Number($('Production Send Configuration').first().json.stale_minutes) <= 1440 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "stale-window-valid"
+            },
+            {
+              "leftValue": "={{ Boolean($('Production Send Configuration').first().json.listmonk_api_auth_present) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "listmonk-auth-valid"
+            },
+            {
+              "leftValue": "={{ $('Production Send Configuration').first().json.request_source !== 'control_center_webhook' || String($('Production Send Configuration').first().json.request_action).toLowerCase() === 'execute' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "webhook-action-valid"
+            },
+            {
+              "leftValue": "={{ Boolean($('Production Send Configuration').first().json.request_secret_valid) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "webhook-secret-valid"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8e461525-3b22-4347-ae41-866139c0ebb1",
+      "name": "Production Configuration Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -1040,
+        1616
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "result",
+              "name": "result",
+              "value": "production_configuration_invalid",
+              "type": "string"
+            },
+            {
+              "id": "reason",
+              "name": "reason",
+              "value": "Required production configuration or Control Center execution request is missing or invalid. Sending was not attempted.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d55e2102-5297-420a-a41b-d07eeb9af354",
+      "name": "Production Configuration Invalid",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        -896,
+        2096
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM public.recover_stale_sending_recipients(make_interval(mins => {{ $('Production Send Configuration').first().json.stale_minutes }}), NOW());",
+        "options": {}
+      },
+      "id": "ccc7ff8b-b96e-4fad-bb49-16f5a9ebe9ef",
+      "name": "Recover Stale Sends",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -688,
+        1616
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE public.campaigns\nSET status = 'running',\n    started_at = COALESCE(started_at, NOW()),\n    updated_at = NOW()\nWHERE status = 'scheduled'\n  AND scheduled_at IS NOT NULL\n  AND scheduled_at <= NOW()\n  AND (\n    {{ $('Production Send Configuration').first().json.campaign_id }} = 0\n    OR id = {{ $('Production Send Configuration').first().json.campaign_id }}\n  );\n\nSELECT c.id, c.campaign_key, c.name, c.status, c.scheduled_at, c.batch_size,\n       c.emails_per_minute, c.emails_per_hour, c.emails_per_day,\n       c.max_concurrency, c.max_retries, c.retry_backoff_seconds,\n       c.from_name, c.from_email, c.reply_to, c.subject\nFROM (\n  SELECT campaign_id FROM public.get_next_due_campaign()\n  UNION ALL\n  SELECT {{ $('Production Send Configuration').first().json.campaign_id }}::bigint\n  WHERE {{ $('Production Send Configuration').first().json.campaign_id }} > 0\n) active_ref\nJOIN public.campaigns c ON c.id = active_ref.campaign_id\nLIMIT 1;",
+        "options": {}
+      },
+      "id": "fd2ae1a6-64d9-4c7a-acb6-1eb42e52c9ba",
+      "name": "Activate Due Campaign",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -448,
+        1616
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT c.id, c.campaign_key, c.name, c.status, c.scheduled_at, c.batch_size,\n       c.emails_per_minute, c.emails_per_hour, c.emails_per_day,\n       c.max_concurrency, c.max_retries, c.retry_backoff_seconds,\n       c.from_name, c.from_email, c.reply_to, c.subject\nFROM (\n  SELECT campaign_id FROM public.get_next_due_campaign()\n  UNION ALL\n  SELECT {{ $('Production Send Configuration').first().json.campaign_id }}::bigint\n  WHERE {{ $('Production Send Configuration').first().json.campaign_id }} > 0\n) active_ref\nJOIN public.campaigns c ON c.id = active_ref.campaign_id\nLIMIT 1;",
+        "options": {}
+      },
+      "id": "5da42480-f98e-404b-abd4-7be367b76730",
+      "name": "Load Campaign",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        -192,
+        1616
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "running",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "or"
+        },
+        "options": {}
+      },
+      "id": "b07f75c4-201a-4ea3-b3e3-60d09fc9b266",
+      "name": "Campaign Active?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        112,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "result",
+              "name": "result",
+              "value": "campaign_not_active",
+              "type": "string"
+            },
+            {
+              "id": "reason",
+              "name": "reason",
+              "value": "={{ $json.status ? 'Campaign status: ' + $json.status : 'Campaign not found' }}",
+              "type": "string"
+            },
+            {
+              "id": "cfc191ee-c40f-4ae3-afd7-e3c24251c32a",
+              "name": "",
+              "value": "",
+              "type": "string"
+            },
+            {
+              "id": "4a8390fc-fa0d-4999-a2b2-681aacc55825",
+              "name": "",
+              "value": "",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "43a55630-808a-4d3f-bf14-1a8a9ecbd86c",
+      "name": "Campaign Not Active",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        336,
+        1888
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Production Send Configuration').first().json.send_mode }}",
+              "rightValue": "real",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4dac5d28-0e13-47e7-bef3-4b162a7d70aa",
+      "name": "Real Send Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        368,
+        1408
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "result",
+              "name": "result",
+              "value": "send_not_enabled",
+              "type": "string"
+            },
+            {
+              "id": "reason",
+              "name": "reason",
+              "value": "Real sending is disabled; no recipient was claimed and no provider send was attempted.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "1fad6213-2d58-4c03-8b43-c8a1343ef493",
+      "name": "Real Send Disabled",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        640,
+        1856
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT *\nFROM public.claim_one_send_slot(\n  {{ $('Load Campaign').first().json.id }},\n  NOW()\n);",
+        "options": {}
+      },
+      "id": "f568df0a-6ba4-4567-8351-2242f5317650",
+      "name": "Claim One Send Slot",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        656,
+        1456
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.allowed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "bc3843c4-2af9-43fd-9228-3be192367680",
+      "name": "Slot Claimed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        928,
+        1472
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "result",
+              "name": "result",
+              "value": "no_send_available",
+              "type": "string"
+            },
+            {
+              "id": "reason",
+              "name": "reason",
+              "value": "={{ $json.reason || 'No eligible queued recipient or sending limit reached' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d08842bc-3375-4258-9547-0660e6fd464c",
+      "name": "No Send Available",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1088,
+        1856
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM public.create_send_attempt({{ $('Claim One Send Slot').first().json.recipient_id }}, '{{ $('Production Send Configuration').first().json.provider }}');",
+        "options": {}
+      },
+      "id": "a30f47ab-6a3d-478c-a4fc-ac8bf2d88ffc",
+      "name": "Create Send Attempt",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1152,
+        1328
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n    cr.id AS recipient_id,\n    cr.campaign_id,\n    cr.contact_id,\n    cr.email_normalized,\n    cr.attempt_count,\n    c.first_name,\n    c.last_name,\n    c.company,\n    c.title,\n    c.industry,\n    ca.campaign_key,\n    ca.from_name,\n    ca.from_email,\n    ca.reply_to,\n    REPLACE(\n      REPLACE(\n        REPLACE(\n          REPLACE(\n            REPLACE(\n              COALESCE(tv.subject, ca.subject),\n              CHR(123)||CHR(123)||'first_name'||CHR(125)||CHR(125), CHR(123)||CHR(123)||' .Tx.Data.first_name '||CHR(125)||CHR(125)\n            ),\n            CHR(123)||CHR(123)||'last_name'||CHR(125)||CHR(125), CHR(123)||CHR(123)||' .Tx.Data.last_name '||CHR(125)||CHR(125)\n          ),\n          CHR(123)||CHR(123)||'company'||CHR(125)||CHR(125), CHR(123)||CHR(123)||' .Tx.Data.company '||CHR(125)||CHR(125)\n        ),\n        CHR(123)||CHR(123)||'title'||CHR(125)||CHR(125), CHR(123)||CHR(123)||' .Tx.Data.title '||CHR(125)||CHR(125)\n      ),\n      CHR(123)||CHR(123)||'industry'||CHR(125)||CHR(125), CHR(123)||CHR(123)||' .Tx.Data.industry '||CHR(125)||CHR(125)\n    ) AS subject,\n    tv.listmonk_template_id AS template_id,\n    COALESCE(tv.html_content, '') AS body_html\nFROM public.campaign_recipients cr\nJOIN public.contacts c ON c.id = cr.contact_id\nJOIN public.campaigns ca ON ca.id = cr.campaign_id\nLEFT JOIN public.template_versions tv ON tv.id = ca.template_version_id\nWHERE cr.id = {{ $('Claim One Send Slot').first().json.recipient_id }}\nLIMIT 1;",
+        "options": {}
+      },
+      "id": "ebd19d15-773c-4c0c-9e73-503a1a18d368",
+      "name": "Load Send Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1344,
+        1328
+      ],
+      "alwaysOutputData": true,
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "attempt-id",
+              "name": "attempt_id",
+              "value": "={{ $('Create Send Attempt').first().json.create_send_attempt }}",
+              "type": "number"
+            },
+            {
+              "id": "recipient-id",
+              "name": "recipient_id",
+              "value": "={{ $json.recipient_id }}",
+              "type": "number"
+            },
+            {
+              "id": "campaign-id",
+              "name": "campaign_id",
+              "value": "={{ $json.campaign_id }}",
+              "type": "number"
+            },
+            {
+              "id": "email",
+              "name": "email",
+              "value": "={{ $json.email_normalized || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "first",
+              "name": "first_name",
+              "value": "={{ $json.first_name || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "last",
+              "name": "last_name",
+              "value": "={{ $json.last_name || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "company",
+              "name": "company",
+              "value": "={{ $json.company || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "from-name",
+              "name": "from_name",
+              "value": "={{ $json.from_name || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "from-email",
+              "name": "from_email",
+              "value": "={{ $json.from_email || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "reply-to",
+              "name": "reply_to",
+              "value": "={{ $json.reply_to || $json.from_email || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "subject",
+              "name": "subject",
+              "value": "={{ $json.subject || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "send-mode",
+              "name": "send_mode",
+              "value": "={{ $('Production Send Configuration').first().json.send_mode }}",
+              "type": "string"
+            },
+            {
+              "id": "template-id",
+              "name": "template_id",
+              "value": "={{ $json.template_id ? Number($json.template_id) : null }}",
+              "type": "number"
+            },
+            {
+              "id": "body-html",
+              "name": "body_html",
+              "value": "={{ $json.body_html || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "title",
+              "name": "title",
+              "value": "={{ $json.title || '' }}",
+              "type": "string"
+            },
+            {
+              "id": "industry",
+              "name": "industry",
+              "value": "={{ $json.industry || '' }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "d79a6a1c-ea2c-43cf-ae9b-a104de0ba887",
+      "name": "Normalize Send Context",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1568,
+        1280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Number($json.attempt_id) > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "attempt-valid"
+            },
+            {
+              "leftValue": "={{ $json.email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            },
+            {
+              "leftValue": "={{ $json.from_email }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            },
+            {
+              "leftValue": "={{ $json.subject }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            },
+            {
+              "leftValue": "={{ Number($json.template_id) > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true"
+              },
+              "id": "template-valid"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "4115ee46-fd37-4bb8-a8bc-b7b18aa37d93",
+      "name": "Send Context Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1776,
+        1280
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM public.mark_send_failure(\n  {{ $('Normalize Send Context').first().json.attempt_id }},\n  'invalid_context',\n  'Required send context was missing or invalid',\n  FALSE\n);",
+        "options": {}
+      },
+      "id": "ab795840-f8fa-4004-b8d8-f593cd95c516",
+      "name": "Mark Send Failure - Invalid Context",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2032,
+        1904
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://listmonk:9000/api/tx",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "={{ $env.LISTMONK_API_AUTH }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n  {\n    subscriber_mode: 'external',\n    subscriber_emails: [$json.email],\n    template_id: Number($json.template_id),\n    from_email: `${$json.from_name} <${$json.from_email}>`,\n    subject: $json.subject,\n    headers: $json.reply_to ? [{ name: 'Reply-To', value: $json.reply_to }] : [],\n    data: {\n      first_name: $json.first_name,\n      last_name: $json.last_name,\n      company: $json.company,\n      title: $json.title,\n      industry: $json.industry,\n      FirstName: $json.first_name,\n      LastName: $json.last_name,\n      Company: $json.company,\n      Title: $json.title,\n      Industry: $json.industry,\n      body_html: $json.body_html,\n      campaign_id: $json.campaign_id,\n      recipient_id: $json.recipient_id,\n      attempt_id: $json.attempt_id\n    },\n    content_type: 'html',\n    messenger: 'email'\n  }\n}}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true,
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "88667c18-1e15-430e-9c14-0b84129fb3ba",
+      "name": "Listmonk Transactional Send",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2016,
+        1296
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.data === true || $json.body?.data === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              },
+              "id": "30f5330c-2540-4696-b6c9-953ee20054b7"
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5d3b14d7-5d72-4c87-90f6-a684e5343306",
+      "name": "Provider Send Succeeded?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2272,
+        1248
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT public.mark_send_success(\n  {{ Number($('Normalize Send Context').first().json.attempt_id) }}::bigint,\n  ''::text\n);",
+        "options": {}
+      },
+      "id": "64b1f3b7-92ce-466e-a102-b0503ab6323f",
+      "name": "Mark Send Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2720,
+        1216
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM public.mark_send_failure(\n  {{ $('Normalize Send Context').first().json.attempt_id }},\n  'provider_error',\n  '{{ String($json.message || $json.error || $json.body?.message || 'Listmonk transactional send failed').replace(/'/g, \"''\") }}',\n  {{ [408, 409, 425, 429].includes(Number($json.statusCode)) || (Number($json.statusCode) >= 500 && Number($json.statusCode) <= 599) ? 'TRUE' : 'FALSE' }}\n);",
+        "options": {}
+      },
+      "id": "a7fa35f2-dc89-4bc7-868c-9c85837e24b9",
+      "name": "Mark Send Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2720,
+        1440
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM public.mark_send_failure(\n  {{ $('Normalize Send Context').first().json.attempt_id }},\n  'transport_error',\n  '{{ String($json.message || $json.error?.message || 'Listmonk HTTP transport error').replace(/'/g, \"''\") }}',\n  TRUE\n);",
+        "options": {}
+      },
+      "id": "a08aac65-6c59-4800-ae86-dae2a4a37e30",
+      "name": "Mark Send Failure - Transport Error",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2272,
+        1456
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM public.finalize_campaign_if_complete(\n  {{ $('Normalize Send Context').first().json.campaign_id }},\n  NOW()\n);",
+        "options": {}
+      },
+      "id": "604859c2-645b-403d-a081-23a58d0de810",
+      "name": "Finalize Campaign If Complete",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        3008,
+        1328
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM public.finalize_campaign_if_complete(\n  {{ $('Normalize Send Context').first().json.campaign_id }},\n  NOW()\n);",
+        "options": {}
+      },
+      "id": "75a4cb9a-10b4-4c24-b879-1ff9e87acd60",
+      "name": "Finalize Campaign After Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        2800,
+        1872
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "i9GU9hjwcjEabaZc",
+          "name": "Postgres account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "first-client/execute",
+        "options": {}
+      },
+      "id": "2a9b330c-7222-4afe-9ef6-39f1d84afa80",
+      "name": "Control Center Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -2160,
+        2032
+      ],
+      "webhookId": "first-client-execute"
+    },
+    {
+      "parameters": {
+        "content": "CONTROL CENTER WEBHOOK\n\nPOST /webhook/first-client/execute\n\nExpected JSON:\n{\n  \"action\": \"execute\",\n  \"campaign_id\": 123,\n  \"execution_id\": \"unique-id\",\n  \"secret\": \"server-side webhook secret\"\n}\n\nThe webhook does NOT accept recipient emails, arbitrary content, provider credentials, or send limits. PostgreSQL remains authoritative for recipient eligibility, caps, rate limits, concurrency, and claiming.\n\nSet N8N_EXECUTION_WEBHOOK_SECRET in n8n. Keep the secret server-side in the Control Center. Do not put it in browser code.",
+        "height": 270,
+        "width": 420
+      },
+      "id": "eb108f0c-b01a-49bc-9d6e-0053a4d06d92",
+      "name": "Control Center Webhook Contract",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2000,
+        48
+      ]
+    },
+    {
+      "parameters": {
+        "content": "Trigger Nodes\n\nManual Trigger \n\nScheduler\n\nWebhook - Trigger directly from website\n",
+        "height": 1168,
+        "width": 720
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "position": [
+        -2464,
+        1248
+      ],
+      "typeVersion": 1,
+      "id": "8e5ebc84-c5a1-408e-ad8a-792b32cb4eae",
+      "name": "Sticky Note2"
+    }
+  ],
+  "connections": {
+    "Send Context Valid?": {
+      "main": [
+        [
+          {
+            "node": "Listmonk Transactional Send",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Send Failure - Invalid Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Send Failure - Invalid Context": {
+      "main": [
+        [
+          {
+            "node": "Finalize Campaign After Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Send Failure": {
+      "main": [
+        [
+          {
+            "node": "Finalize Campaign After Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Send Success": {
+      "main": [
+        [
+          {
+            "node": "Finalize Campaign If Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Provider Send Succeeded?": {
+      "main": [
+        [
+          {
+            "node": "Mark Send Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Send Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Listmonk Transactional Send": {
+      "main": [
+        [
+          {
+            "node": "Provider Send Succeeded?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Mark Send Failure - Transport Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Send Context": {
+      "main": [
+        [
+          {
+            "node": "Send Context Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Send Context": {
+      "main": [
+        [
+          {
+            "node": "Normalize Send Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every Minute": {
+      "main": [
+        [
+          {
+            "node": "Production Send Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Production Send Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Production Send Configuration": {
+      "main": [
+        [
+          {
+            "node": "Production Configuration Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Production Configuration Valid?": {
+      "main": [
+        [
+          {
+            "node": "Recover Stale Sends",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Production Configuration Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Recover Stale Sends": {
+      "main": [
+        [
+          {
+            "node": "Activate Due Campaign",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Activate Due Campaign": {
+      "main": [
+        [
+          {
+            "node": "Load Campaign",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Campaign": {
+      "main": [
+        [
+          {
+            "node": "Campaign Active?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Campaign Active?": {
+      "main": [
+        [
+          {
+            "node": "Real Send Enabled?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Campaign Not Active",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Real Send Enabled?": {
+      "main": [
+        [
+          {
+            "node": "Claim One Send Slot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Real Send Disabled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim One Send Slot": {
+      "main": [
+        [
+          {
+            "node": "Slot Claimed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Slot Claimed?": {
+      "main": [
+        [
+          {
+            "node": "Create Send Attempt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Send Available",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Send Attempt": {
+      "main": [
+        [
+          {
+            "node": "Load Send Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Send Failure - Transport Error": {
+      "main": [
+        [
+          {
+            "node": "Finalize Campaign After Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Control Center Webhook": {
+      "main": [
+        [
+          {
+            "node": "Production Send Configuration",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Production Configuration Invalid": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "createdAt": "2026-10-04T13:31:15.167Z",
+  "updatedAt": "2026-10-05T18:29:28.183Z",
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "staticData": null,
+  "pinData": {},
+  "versionId": "726d48b4-c7e7-42b8-8498-e42d39e049e8",
+  "triggerCount": 2,
+  "id": "0bpUThoUS9wcBnpJ",
+  "meta": null,
+  "parentFolderId": null,
+  "isArchived": false,
+  "versionCounter": 27,
+  "description": null,
+  "activeVersionId": "f335b354-5016-49ef-aaae-70750d7dee58",
+  "nodeGroups": [],
+  "sourceWorkflowId": null
+}

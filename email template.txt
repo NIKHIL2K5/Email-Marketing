@@ -1,0 +1,35 @@
+1.  First Name
+2.  Last Name
+3.  Title
+4.  Company
+5.  Company Name for Emails
+6.  Email
+7.  Seniority
+8.  Departments
+9.  First Phone
+10. Corporate Phone
+11. # Employees
+12. Industry
+13. Keywords
+14. Person Linkedin Url
+15. Website
+16. Company Linkedin Url
+17. Facebook Url
+18. Twitter Url
+19. City
+20. State
+21. Country
+22. Company Address
+23. Company City
+24. Company State
+25. Company Country
+26. Company Phone
+27. SEO Description
+28. Technologies
+29. Annual Revenue
+
+
+File:        contacts_original.csv
+Size:        ~35.4 MB
+Columns:     29
+Physical lines: 55,558
