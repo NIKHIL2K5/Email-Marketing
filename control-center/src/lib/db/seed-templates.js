@@ -2,7 +2,7 @@ const { Client } = require('pg');
 
 async function seed() {
   const c = new Client({
-    connectionString: process.env.DATABASE_URL || 'postgresql://emailapp:FirstClient_Postgres_2026_Strong!@localhost:5433/contacts',
+    connectionString: process.env.DATABASE_URL,
   });
 
   await c.connect();

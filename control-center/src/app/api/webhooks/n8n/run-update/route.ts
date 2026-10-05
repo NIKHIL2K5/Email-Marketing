@@ -5,7 +5,14 @@ export const dynamic = 'force-dynamic';
 
 export async function POST(request: NextRequest) {
   const ip = request.headers.get('x-forwarded-for') || request.headers.get('x-real-ip') || 'unknown';
-  const configuredSecret = process.env.N8N_EXECUTION_WEBHOOK_SECRET || 'FirstClient_Execution_Sec_2026_x89q2';
+  const configuredSecret = process.env.N8N_EXECUTION_WEBHOOK_SECRET;
+
+if (!configuredSecret) {
+  return NextResponse.json(
+    { error: 'N8N execution webhook secret is not configured' },
+    { status: 500 }
+  );
+}
 
   const headerSecret =
     request.headers.get('x-n8n-webhook-secret') ||
